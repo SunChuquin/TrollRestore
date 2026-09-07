@@ -163,3 +163,33 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+/bg_err.txt
+/bg_out.txt
+/deploy_state.json
+/du_err.txt
+/du_out.txt
+/enter.txt
+/error.txt
+/final_err.txt
+/final_out.txt
+/http_server_pid.txt
+/input.txt
+/kline_debug_log.txt
+/launch_err.txt
+/launch_out.txt
+/output.txt
+/redir_err.txt
+/redir_out.txt
+/s2_err.txt
+/s2_out.txt
+/s3_err.txt
+/s3_out.txt
+/stdin.txt
+/tabs_err.txt
+/tabs_out.txt
+/test_err.txt
+/test_out.txt
+/ts_err.txt
+/ts_out.txt
+/wi_err.txt
+/wi_out.txt
