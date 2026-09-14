@@ -99,7 +99,8 @@ def get_lan_ip() -> str:
 
 
 def gh(*args: str) -> str:
-    r = subprocess.run(["gh", *args], capture_output=True, text=True, cwd=str(REPO_DIR))
+    r = subprocess.run(["gh", *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", cwd=str(REPO_DIR))
     if r.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} 失败: {(r.stderr or r.stdout)[-500:]}")
     return r.stdout
@@ -151,7 +152,8 @@ def resolve_run_id(text: str) -> tuple[str, dict]:
 
 def kill_port(port: int) -> None:
     try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace").stdout
         for line in out.splitlines():
             if f":{port}" in line and "LISTENING" in line:
                 pid = line.split()[-1]
