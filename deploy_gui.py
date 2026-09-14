@@ -46,6 +46,7 @@ IPA_SUB = ["Kline-unsigned-ipa", "Kline.ipa"]
 WAIT_KLINE_SECONDS = 180
 WAIT_REOPEN_SECONDS = 300   # 触发安装后，等待新版 Kline 重新打开的最长时间
 GH_POLL_SECONDS = 30        # 自动监控：轮询 GitHub Actions 最新 run 的间隔
+RUN_LIST_LOOKUP = 500       # 手动输入 #编号 时，最多回溯多少个 run 查找对应的 databaseId
 STATE_FILE = Path(__file__).resolve().parent / "deploy_state.json"   # 记住上次已处理的 run id，避免重复部署
 
 _status = "空闲"
@@ -102,6 +103,50 @@ def gh(*args: str) -> str:
     if r.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} 失败: {(r.stderr or r.stdout)[-500:]}")
     return r.stdout
+
+
+def resolve_run_id(text: str) -> tuple[str, dict]:
+    """把手动输入解析为 GitHub Actions run 的 databaseId。
+
+    支持两种写法：
+      - 完整 RUN ID（databaseId，如 34795974841，gh run download 实际使用的 ID）
+      - 网页上显示的构建编号（如 187 或 #187），自动在最近 RUN_LIST_LOOKUP 个 run 中转换
+    返回 (databaseId, run_info)；run_info 含 number/displayTitle/status/conclusion。
+    """
+    s = text.strip().lstrip("#").strip()
+    if not s.isdigit():
+        raise RuntimeError("请输入纯数字：完整 RUN ID（如 34795974841）或构建编号（如 187）")
+
+    def ensure_success(r: dict) -> dict:
+        if r.get("status") != "completed" or r.get("conclusion") != "success":
+            raise RuntimeError(
+                f"run #{r.get('number')} 状态为 {r.get('status')}/{r.get('conclusion')}，"
+                "只能部署构建成功（completed/success）的 run")
+        return r
+
+    # 1) 先按 databaseId 直查（gh 只认长 ID，一次 API 调用）
+    info = None
+    try:
+        info = json.loads(gh("run", "view", s, "--json",
+                             "databaseId,number,status,conclusion,displayTitle"))
+    except RuntimeError:
+        info = None
+    if info is not None:
+        return str(info["databaseId"]), ensure_success(info)
+
+    # 2) 当作网页上的构建编号，拉最近 run 列表匹配 number 字段
+    target = int(s)
+    runs = json.loads(gh("run", "list", "--limit", str(RUN_LIST_LOOKUP),
+                         "--json", "databaseId,number,status,conclusion,displayTitle"))
+    for r in runs:
+        if r.get("number") == target:
+            return str(r["databaseId"]), ensure_success(r)
+    if runs:
+        span = f"#{runs[-1].get('number')} ~ #{runs[0].get('number')}"
+        raise RuntimeError(
+            f"最近 {RUN_LIST_LOOKUP} 个 run（{span}）中找不到构建编号 #{s}；"
+            "请确认编号，或直接粘贴完整 RUN ID")
+    raise RuntimeError("GitHub Actions run 列表为空，无法解析构建编号")
 
 
 def kill_port(port: int) -> None:
@@ -183,12 +228,22 @@ class DeployWorker(QThread):
     status = Signal(str)
     poll_ctrl = Signal(bool)   # True=部署开始，关闭自动监控（下次 TRAE 推送构建时才重新开启）
 
-    def __init__(self, run_id: str, parent=None):
+    def __init__(self, run_id: str, parent=None, resolve: bool = False):
         super().__init__(parent)
         self.run_id = run_id
+        self.resolve = resolve
 
     def run(self):
         try:
+            if self.resolve:
+                # 手动输入可能是网页上的 #编号，先解析成 gh 认的 databaseId
+                self.status.emit("解析构建编号...")
+                rid, info = resolve_run_id(self.run_id)
+                self.run_id = rid
+                self.log.emit(
+                    f"🔎 #{info.get('number')} -> run={rid}"
+                    f"（{info.get('displayTitle', '')[:50]}）")
+            save_last_processed(self.run_id)
             self.poll_ctrl.emit(True)   # 下载 IPA 之前先关闭自动监控，避免部署期间重复触发
             self.log.emit(f"▶ 开始部署 run={self.run_id}")
             self.status.emit("下载 IPA...")
@@ -427,10 +482,11 @@ class MainWindow(QMainWindow):
         gb = QGroupBox("手动部署")
         gl = QHBoxLayout(gb)
         self.run_id_edit = QLineEdit()
-        self.run_id_edit.setPlaceholderText("GitHub Actions RUN ID")
+        self.run_id_edit.setPlaceholderText("RUN ID（长数字）或网页编号（如 187 / #187）")
+        self.run_id_edit.returnPressed.connect(self.manual_deploy)
         gl.addWidget(self.run_id_edit, 1)
         self.btn_deploy = QPushButton("开始部署")
-        self.btn_deploy.clicked.connect(lambda: self.start_worker(self.run_id_edit.text().strip()))
+        self.btn_deploy.clicked.connect(self.manual_deploy)
         gl.addWidget(self.btn_deploy)
         self.btn_clear = QPushButton("清空日志")
         self.btn_clear.clicked.connect(lambda: self.log_view.clear())
@@ -444,7 +500,7 @@ class MainWindow(QMainWindow):
 
         self.log("Kline-TS 自动部署助手已启动")
         self.log(f"通知监听: http://127.0.0.1:{LISTEN_PORT}/notify")
-        self.log("使用方法：TRAE 构建成功后 POST /notify，或手动填入 RUN ID 点「开始部署」。")
+        self.log("使用方法：TRAE 构建成功后 POST /notify，或手动填入 RUN ID / #编号（如 187）点「开始部署」。")
 
         # HTTP 服务（后台线程）
         handler = type("H", (NotifyHandler,), {"bridge": self.bridge})
@@ -500,15 +556,18 @@ class MainWindow(QMainWindow):
         self.log(f"\n📨 收到通知 run_id={run_id}")
         self.start_worker(run_id)
 
-    def start_worker(self, run_id: str):
+    def manual_deploy(self):
+        """手动按钮/回车：输入可能是 #编号，交给 worker 解析后部署"""
+        self.start_worker(self.run_id_edit.text().strip(), resolve=True)
+
+    def start_worker(self, run_id: str, resolve: bool = False):
         if not run_id:
-            self.log("⚠ 未提供 RUN ID")
+            self.log("⚠ 未提供 RUN ID / 构建编号")
             return
         if hasattr(self, "worker") and self.worker.isRunning():
             self.log(f"⚠ 正在部署中，忽略新通知 run={run_id}")
             return
-        save_last_processed(run_id)
-        self.worker = DeployWorker(run_id)
+        self.worker = DeployWorker(run_id, resolve=resolve)
         self.worker.log.connect(self.log)
         self.worker.status.connect(lambda s: (set_status(s), self.status_label.setText(s)))
         self.worker.poll_ctrl.connect(self.on_poll_ctrl)
