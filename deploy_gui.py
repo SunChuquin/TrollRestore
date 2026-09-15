@@ -53,6 +53,11 @@ GH_POLL_SECONDS = 30        # 自动监控：轮询 GitHub Actions 最新 run �
 RUN_LIST_LOOKUP = 500       # 手动输入 #编号 时，最多回溯多少个 run 查找对应的 databaseId
 STATE_FILE = Path(__file__).resolve().parent / "deploy_state.json"   # 记住上次已处理的 run id，避免重复部署
 
+# Windows 上本助手由 pythonw.exe（GUI 进程）运行，自身无控制台；子进程若不加 CREATE_NO_WINDOW
+# 会各自弹一个临时 cmd 窗口（gh/netstat/taskkill/pymobiledevice3 都是控制台程序）。
+# 统一放在常量避免在四处调用点重复散布。非 Windows 平台无此 flag，回退为 0 也不会报错。
+NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
 _status = "空闲"
 _autopoll_on = True     # 自动监控开关状态（供 GET /status 查询；TRAE 可经 POST /autopoll 开启）
 
@@ -104,7 +109,8 @@ def get_lan_ip() -> str:
 
 def gh(*args: str) -> str:
     r = subprocess.run(["gh", *args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", cwd=str(REPO_DIR))
+                       encoding="utf-8", errors="replace", cwd=str(REPO_DIR),
+                       creationflags=NO_WINDOW_FLAGS)
     if r.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} 失败: {(r.stderr or r.stdout)[-500:]}")
     return r.stdout
@@ -157,11 +163,13 @@ def resolve_run_id(text: str) -> tuple[str, dict]:
 def kill_port(port: int) -> None:
     try:
         out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace").stdout
+                             encoding="utf-8", errors="replace",
+                             creationflags=NO_WINDOW_FLAGS).stdout
         for line in out.splitlines():
             if f":{port}" in line and "LISTENING" in line:
                 pid = line.split()[-1]
-                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True,
+                               creationflags=NO_WINDOW_FLAGS)
     except Exception:
         pass
 
@@ -172,6 +180,7 @@ def start_forward() -> subprocess.Popen:
     fwd = subprocess.Popen(
         [str(PM), "usbmux", "forward", str(DEVICE_PORT), str(DEVICE_PORT)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=NO_WINDOW_FLAGS,
     )
     time.sleep(3)
     return fwd
