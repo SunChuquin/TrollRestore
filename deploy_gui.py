@@ -6,8 +6,9 @@
   2. 构建成功生成 IPA 后，TRAE 只需 POST 通知本工具：
         curl -X POST http://127.0.0.1:5052/notify -H "Content-Type: application/json" -d "{\"run_id\":\"<RUN_ID>\"}"
   3. 工具自动执行流水线：
-        a. gh run download 拉取 IPA 到固定路径
-        b. 检查 Kline-TS 前台（不在前台则提示等待）
+        a. 设备就绪门禁：30s 内探测 Kline-TS 是否在前台（iPad 锁屏/未前台则不下载不安装，
+           进入"设备无人值守"终态，等人工解锁打开 Kline 后重新通知，构建产物无需重建）
+        b. gh run download 拉取 IPA 到固定路径
         c. 经 usbmux forward + KlineHTTP /sandbox 流式上传 IPA 到沙盒 Downloads/
         d. POST /install-local (scope=sandbox) 让 Kline 拉起 TrollStore 安装
   4. 用户在 iPad 上手动点「打开」+「Install」
@@ -43,8 +44,11 @@ LISTEN_PORT = 5052     # 本工具通知监听端口
 DEVICE_PORT = 5051     # KlineHTTP 端口
 IPA_PORT = 5053        # 本工具 IPA 下载服务端口（TrollStore 从此下载，不依赖 Kline 前台）
 IPA_SUB = ["Kline-unsigned-ipa", "Kline.ipa"]
-WAIT_KLINE_SECONDS = 180
+DEVICE_READY_SECONDS = 30   # 设备就绪门禁：下载 IPA 前等待 Kline 前台（有人值守）的最长秒数
+WAIT_KLINE_SECONDS = 180    # 上传前二次确认 Kline 前台的兜底等待秒数
 WAIT_REOPEN_SECONDS = 300   # 触发安装后，等待新版 Kline 重新打开的最长时间
+# 无人值守终态文案中的契约键：build_and_deploy.py 据此映射退出码 6（勿改名，跨进程字符串契约）
+DEVICE_IDLE_KEY = "设备无人值守"
 GH_POLL_SECONDS = 30        # 自动监控：轮询 GitHub Actions 最新 run 的间隔
 RUN_LIST_LOOKUP = 500       # 手动输入 #编号 时，最多回溯多少个 run 查找对应的 databaseId
 STATE_FILE = Path(__file__).resolve().parent / "deploy_state.json"   # 记住上次已处理的 run id，避免重复部署
@@ -236,6 +240,7 @@ class DeployWorker(QThread):
         self.resolve = resolve
 
     def run(self):
+        fwd = None   # USB 转发在设备门禁时建立，全程复用，finally 统一关闭
         try:
             if self.resolve:
                 # 手动输入可能是网页上的 #编号，先解析成 gh 认的 databaseId
@@ -248,9 +253,29 @@ class DeployWorker(QThread):
             save_last_processed(self.run_id)
             self.poll_ctrl.emit(True)   # 下载 IPA 之前先关闭自动监控，避免部署期间重复触发
             self.log.emit(f"▶ 开始部署 run={self.run_id}")
-            self.status.emit("下载 IPA...")
 
-            # 1. gh run download 到固定路径
+            # 0. 设备就绪门禁（下载 IPA 之前）：30s 内 Kline 必须在前台（=有人值守）。
+            #    iPad 锁屏 / Kline 未打开 / USB 断连时直接终止，不白下载 IPA；
+            #    人工解锁打开 Kline 后凭同一 run_id 重新 POST /notify 即可续跑。
+            #    注：afc 在锁屏下仍可用（配对 escrow bag），不能判锁屏，只能靠仅前台在线的 KlineHTTP。
+            self.status.emit("检查设备是否就绪（Kline 前台）...")
+            self.log.emit(f"▶ [门禁] 启动 USB 转发，{DEVICE_READY_SECONDS}s 内探测 KlineHTTP ...")
+            fwd = start_forward()
+            if not wait_online(DEVICE_READY_SECONDS, self.log.emit):
+                self.log.emit(
+                    f"🔒 {DEVICE_READY_SECONDS}s 内 Kline 未在前台"
+                    "（iPad 锁屏 / Kline 未打开 / USB 断连），本次不下载、不安装。")
+                self.log.emit(
+                    f"   请解锁 iPad 并打开 Kline 保持前台，然后重新通知部署"
+                    f"（POST /notify run_id={self.run_id}），构建产物已在，无需重新构建。")
+                self.status.emit(
+                    f"🔒 {DEVICE_IDLE_KEY}：iPad 锁屏或 Kline 未在前台"
+                    f"（run={self.run_id} 构建已完成，解锁打开 Kline 后重新通知部署）")
+                return
+            self.log.emit("✅ 设备就绪（Kline 前台在线），继续下载与部署")
+
+            # 1. gh run download 到固定路径（USB 转发保持不关，后续步骤复用）
+            self.status.emit("下载 IPA...")
             self.log.emit("▶ 清理旧产物 ...")
             for p in ARTIFACTS_DIR.iterdir():
                 if p.is_dir():
@@ -267,55 +292,54 @@ class DeployWorker(QThread):
                 raise RuntimeError(f"未找到 IPA: {ipa}")
             self.log.emit(f"✅ IPA: {ipa} ({ipa.stat().st_size / 1048576:.1f}MB)")
 
-            # 2. 沙盒传输（需 Kline 前台）
+            # 2. 沙盒传输（复用门禁时建立的转发；上传前再做一次前台兜底确认）
             self.status.emit("等待 Kline 前台...")
-            self.log.emit("▶ 启动 USB 转发并检查 KlineHTTP ...")
-            fwd = start_forward()
-            try:
-                if not wait_online(WAIT_KLINE_SECONDS, self.log.emit):
-                    raise RuntimeError(f"Kline-TS 不在前台（{WAIT_KLINE_SECONDS}s 超时）。请打开 Kline 后手动重试。")
-                self.log.emit("✅ Kline 在线")
+            self.log.emit("▶ 复用 USB 转发，上传前再次确认 KlineHTTP ...")
+            if not wait_online(WAIT_KLINE_SECONDS, self.log.emit):
+                raise RuntimeError(f"Kline-TS 不在前台（{WAIT_KLINE_SECONDS}s 超时）。请打开 Kline 后手动重试。")
+            self.log.emit("✅ Kline 在线")
 
-                self.status.emit("传输 IPA 到沙盒...")
-                self.log.emit(f"▶ 流式上传 -> 沙盒 Downloads/Kline.ipa ...")
-                upload_stream(ipa, "Downloads/Kline.ipa", self.log.emit)
+            self.status.emit("传输 IPA 到沙盒...")
+            self.log.emit(f"▶ 流式上传 -> 沙盒 Downloads/Kline.ipa ...")
+            upload_stream(ipa, "Downloads/Kline.ipa", self.log.emit)
 
-                # 3. 触发安装（TrollStore 从 KlineHTTP 本地下载 127.0.0.1，无外网/局域网依赖）
-                #    注意：Kline 调 URL scheme 后会切后台，本地 HTTP 有短暂冻结窗口；
-                #    2MB 下载极快，通常成功。若偶发失败，重新打开 Kline 后重试即可。
-                self.status.emit("触发 TrollStore 安装...")
-                self.log.emit("▶ POST /install-local (scope=sandbox, 本地下载)...")
-                body = json.dumps({"file": "Downloads/Kline.ipa", "scope": "sandbox"}).encode("utf-8")
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{DEVICE_PORT}/install-local",
-                    data=body, headers={"Content-Type": "application/json"}, method="POST",
+            # 3. 触发安装（TrollStore 从 KlineHTTP 本地下载 127.0.0.1，无外网/局域网依赖）
+            #    注意：Kline 调 URL scheme 后会切后台，本地 HTTP 有短暂冻结窗口；
+            #    2MB 下载极快，通常成功。若偶发失败，重新打开 Kline 后重试即可。
+            self.status.emit("触发 TrollStore 安装...")
+            self.log.emit("▶ POST /install-local (scope=sandbox, 本地下载)...")
+            body = json.dumps({"file": "Downloads/Kline.ipa", "scope": "sandbox"}).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{DEVICE_PORT}/install-local",
+                data=body, headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                self.log.emit(f"   HTTP {r.status}: {r.read().decode()}")
+            expected = ipa_version(ipa)
+            self.log.emit("✅ 已触发安装！请在 iPad 上操作：")
+            self.log.emit("   1. 弹「在 TrollStore 中打开？」→ 点「打开」")
+            self.log.emit("   2. TrollStore 下载 IPA → 弹 Install → 点「Install」")
+            self.log.emit(f"   3. 安装完成后打开 Kline（期望新版本 v{expected}）——助手自动检测")
+
+            # 4. 等待新版 Kline 重新打开（USB 转发保持不关）：
+            #    新版 Kline 启动后 KlineHTTP 恢复在线并回报 version 字段，匹配即部署完成。
+            self.status.emit("等待 iPad 确认安装（打开新版 Kline 后自动完成）")
+            reopened = self.wait_kline_reopen(expected, WAIT_REOPEN_SECONDS)
+            if reopened:
+                self.log.emit(f"🎉 部署完成：Kline 已重新打开并运行 v{expected}")
+                self.status.emit(f"✅ 部署完成：Kline v{expected}")
+            else:
+                self.log.emit(
+                    f"⚠ {WAIT_REOPEN_SECONDS}s 内未检测到新版 Kline 打开。"
+                    "IPA 仍在沙盒 Downloads/Kline.ipa，打开新版 Kline 后再点一次「开始部署」即可。"
                 )
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    self.log.emit(f"   HTTP {r.status}: {r.read().decode()}")
-                expected = ipa_version(ipa)
-                self.log.emit("✅ 已触发安装！请在 iPad 上操作：")
-                self.log.emit("   1. 弹「在 TrollStore 中打开？」→ 点「打开」")
-                self.log.emit("   2. TrollStore 下载 IPA → 弹 Install → 点「Install」")
-                self.log.emit(f"   3. 安装完成后打开 Kline（期望新版本 v{expected}）——助手自动检测")
-
-                # 4. 等待新版 Kline 重新打开（USB 转发保持不关）：
-                #    新版 Kline 启动后 KlineHTTP 恢复在线并回报 version 字段，匹配即部署完成。
-                self.status.emit("等待 iPad 确认安装（打开新版 Kline 后自动完成）")
-                reopened = self.wait_kline_reopen(expected, WAIT_REOPEN_SECONDS)
-                if reopened:
-                    self.log.emit(f"🎉 部署完成：Kline 已重新打开并运行 v{expected}")
-                    self.status.emit(f"✅ 部署完成：Kline v{expected}")
-                else:
-                    self.log.emit(
-                        f"⚠ {WAIT_REOPEN_SECONDS}s 内未检测到新版 Kline 打开。"
-                        "IPA 仍在沙盒 Downloads/Kline.ipa，打开新版 Kline 后再点一次「开始部署」即可。"
-                    )
-                    self.status.emit("部署超时：未检测到新版 Kline 打开")
-            finally:
-                fwd.terminate()
+                self.status.emit("部署超时：未检测到新版 Kline 打开")
         except Exception as e:
             self.log.emit(f"❌ {e}")
             self.status.emit("部署失败")
+        finally:
+            if fwd is not None:
+                fwd.terminate()
 
     def wait_kline_reopen(self, expected: str, timeout: float) -> bool:
         """安装触发后等待新版 Kline 重新打开。
