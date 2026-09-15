@@ -7,10 +7,13 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
   1. 接收 AI 传入的提交描述信息，git add + commit + push 触发 GitHub Actions
   2. 轮询监控本次推送（按 headSha 匹配）的 Actions run 直到结束
   3. 构建失败 → 拉取失败日志，保存到 build_logs 并摘录 error 行输出，供 AI 分析修复（退出码 1）
-  4. 构建成功 → 检测自动部署助手（deploy_gui.py）：离线则自动后台拉起并等在线，
+  4. 构建成功 → 设备就绪门禁：经 usbmux forward 探测设备上 KlineHTTP（:5051，仅 Kline
+     在前台时响应）。30s 内不可达视为"无人值守"（iPad 锁屏 / Kline 未在前台 / USB 断连），
+     不通知助手，以退出码 6 结束，等待人工解锁并打开 Kline 后续跑
+  5. 设备在线 → 检测自动部署助手（deploy_gui.py）：离线则自动后台拉起并等在线，
      然后 POST :5052/notify {"run_id"} 通知部署，
      助手自动完成：下载 IPA → USB 沙盒推送 → TrollStore 安装 → opener 自动打开新版并校验版本
-  5. 默认等待助手部署终态并回报；--no-wait 可在通知后立即返回
+  6. 默认等待助手部署终态并回报；--no-wait 可在通知后立即返回
 
 用法：
   python build_and_deploy.py "修复编译错误：xxx"
@@ -25,6 +28,9 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
   3 = 自动部署助手无法自动启动（或启动后未在线，请检查 deploy_gui.py 窗口）
   4 = 等待超时（run 未出现 / 构建超时 / 部署未达终态）
   5 = 助手正忙（部署中，通知会被忽略，稍后重试）
+  6 = 设备无人值守（构建已成功，但 30s 内 KlineHTTP 不响应：iPad 锁屏 /
+      Kline 未在前台 / USB 断连）；未通知部署助手，等人工解锁 iPad、打开 Kline
+      保持前台后，凭 RESULT 中的 run_id 手动 POST :5052/notify 续跑部署，无需重新构建
 
 依赖：Python 3.8+（仅标准库）、git、gh（已登录，repo 权限）。
 
@@ -48,7 +54,12 @@ LOG_DIR = Path(r"c:\Users\sunck\home\projects\ios\build_logs")
 ASSISTANT_BASE = "http://127.0.0.1:5052"   # deploy_gui.py 通知监听端口
 DEPLOY_GUI = Path(r"c:\Users\sunck\home\projects\ios\TrollRestore\deploy_gui.py")
 VENV_PYTHONW = Path(r"c:\Users\sunck\home\projects\ios\.venv-ios\Scripts\pythonw.exe")
+PM3 = Path(r"c:\Users\sunck\home\projects\ios\.venv-ios\Scripts\pymobiledevice3.exe")
 ASSISTANT_START_TIMEOUT = 30  # 自动启动助手后等待其在线的最长时间（秒）
+
+KLINE_HTTP_PORT = 5051      # 设备上 KlineHTTP 端口（仅 Kline 在前台时可用，锁屏不响应）
+DEVICE_GATE_TIMEOUT = 30    # 构建成功后等待"设备有人值守"的最长秒数（用户确认为 30s）
+DEVICE_PROBE_INTERVAL = 3   # KlineHTTP 轮询间隔（秒）
 
 POLL_INTERVAL = 10        # 构建状态轮询间隔（秒）
 RUN_APPEAR_TIMEOUT = 120  # 推送后等待 Actions run 出现的最长时间（秒）
@@ -178,6 +189,70 @@ def handle_failure(rid, cwd):
     return str(log_file)
 
 
+def kill_port(port):
+    """杀掉占用本地端口的 LISTENING 进程（usbmux forward 重入前清场，避免 OSError 10048）"""
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace").stdout
+        for line in out.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                subprocess.run(["taskkill", "/F", "/PID", line.split()[-1]],
+                               capture_output=True)
+    except Exception:
+        pass
+
+
+def kline_http_up():
+    """探测设备上的 KlineHTTP 是否在线（Kline 在前台才响应）。回环请求必须绕过系统代理。"""
+    try:
+        with _OPENER.open(f"http://127.0.0.1:{KLINE_HTTP_PORT}/", timeout=4) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def ensure_device_ready(timeout):
+    """构建成功后的"有人值守"门禁。
+
+    启动 usbmux forward（本机 :5051 → 设备 :5051），在 timeout 秒内轮询 KlineHTTP：
+    有响应 = Kline 正在前台（人在设备前、可接收部署）→ True；
+    超时不响应 = iPad 锁屏 / Kline 未在前台 / USB 断连 → False（无人值守，不部署）。
+
+    注：afc 在锁屏下仍可正常使用（配对 escrow bag），无法据此判别锁屏，故门禁用 KlineHTTP。
+    无论成功失败，退出前必须终止本函数启动的转发进程并清场端口——随后部署助手会自己
+    再开一个 usbmux forward，残留进程会与之抢占 5051 端口。
+    返回 (ready: bool, reason: str)。
+    """
+    if not PM3.exists():
+        return False, f"找不到 pymobiledevice3（{PM3}），无法检查设备是否锁屏/在前台"
+    kill_port(KLINE_HTTP_PORT)
+    time.sleep(1)
+    fwd = subprocess.Popen(
+        [str(PM3), "usbmux", "forward", str(KLINE_HTTP_PORT), str(KLINE_HTTP_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + timeout
+    try:
+        time.sleep(3)  # 等转发通道建立
+        while time.time() < deadline:
+            if fwd.poll() is not None:
+                return False, "usbmux forward 进程提前退出（iPad 可能未 USB 连接或未信任电脑）"
+            if kline_http_up():
+                return True, ""
+            remaining = max(0, int(deadline - time.time()))
+            log(f"🔒 KlineHTTP 未响应（iPad 可能锁屏或 Kline 不在前台），"
+                f"等待人工解锁并打开 Kline（剩余 {remaining}s）...")
+            time.sleep(DEVICE_PROBE_INTERVAL)
+        return False, f"{timeout}s 内 KlineHTTP 始终不可达（iPad 锁屏 / Kline 未在前台 / USB 断连）"
+    finally:
+        fwd.terminate()
+        try:
+            fwd.wait(timeout=5)
+        except Exception:
+            fwd.kill()
+        kill_port(KLINE_HTTP_PORT)
+
+
 def assistant_status():
     try:
         _, data = http_json(f"{ASSISTANT_BASE}/status", timeout=3)
@@ -276,6 +351,8 @@ def main():
     ap.add_argument("--branch", default="main")
     ap.add_argument("--no-wait", action="store_true", help="通知助手后立即返回，不等待部署终态")
     ap.add_argument("--build-timeout", type=int, default=1200, help="构建监控超时秒数")
+    ap.add_argument("--device-timeout", type=int, default=DEVICE_GATE_TIMEOUT,
+                    help=f"构建成功后等待设备有人值守（Kline 前台）的最长秒数，默认 {DEVICE_GATE_TIMEOUT}")
     ap.add_argument("--deploy-timeout", type=int, default=600, help="部署终态等待超时秒数")
     args = ap.parse_args()
 
@@ -287,7 +364,7 @@ def main():
     common = {"run_id": None, "commit": None, "message": args.message}
     try:
         # ---- 1. 提交 ----
-        log(f"[1/5] 提交变更到 {args.branch}（描述：{args.message}）")
+        log(f"[1/6] 提交变更到 {args.branch}（描述：{args.message}）")
         add_args = ["git", "add", *(args.files if args.files else ["-A"])]
         sh(add_args, cwd=repo)
         staged = sh(["git", "diff", "--cached", "--name-only"], cwd=repo).stdout.strip()
@@ -298,7 +375,7 @@ def main():
             log("   无暂存变更，跳过 commit")
 
         # ---- 2. 推送（含 non-fast-forward 自动 rebase 重试一次）----
-        log("[2/5] 推送到 GitHub 触发 Actions ...")
+        log("[2/6] 推送到 GitHub 触发 Actions ...")
         sh(["git", "fetch", "origin", args.branch], cwd=repo)
         head = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         remote = sh(["git", "rev-parse", f"origin/{args.branch}"], cwd=repo, check=False).stdout.strip()
@@ -317,10 +394,10 @@ def main():
         log(f"✅ 已推送 {sha[:7]}")
 
         # ---- 3. 捕获本次 run 并监控 ----
-        log("[3/5] 捕获本次 Actions run ...")
+        log("[3/6] 捕获本次 Actions run ...")
         rid = wait_for_run(sha, args.branch, repo, RUN_APPEAR_TIMEOUT)
         common["run_id"] = rid
-        log(f"[4/5] 监控构建 run={rid}（典型耗时 40~85s，排队另计）...")
+        log(f"[4/6] 监控构建 run={rid}（典型耗时 40~85s，排队另计）...")
         conclusion = watch_run(rid, repo, args.build_timeout)
 
         # ---- 4. 失败 → 输出日志供 AI 修复；成功 → 通知助手 ----
@@ -331,7 +408,20 @@ def main():
             return 1
         log(f"✅ 构建成功 run={rid}")
 
-        log("[5/5] 通知自动部署助手 ...")
+        # ---- 5. 设备就绪门禁：锁屏/前台无人时不部署，退出码 6 等人工处理 ----
+        log(f"[5/6] 部署前门禁：确认 iPad 有人值守（Kline 在前台，{args.device_timeout}s 窗口）...")
+        ready, why = ensure_device_ready(args.device_timeout)
+        if not ready:
+            log(f"🔒 {why}")
+            log("   本次构建已成功，但设备端无人接收部署，未通知部署助手。")
+            log(f"   请解锁 iPad 并打开 Kline 保持前台，然后凭 run_id={rid} 手动续跑部署"
+                "（POST http://127.0.0.1:5052/notify {\"run_id\": <run_id>}，需绕过代理），无需重新构建。")
+            result_block(exit_code=6, stage="device-gate", reason=why,
+                         hint="人工解锁 iPad 并打开 Kline 后 POST :5052/notify 续跑", **common)
+            return 6
+        log("✅ KlineHTTP 在线（Kline 前台运行），继续部署")
+
+        log("[6/6] 通知自动部署助手 ...")
         ok, err, baseline = notify_assistant(rid)
         if not ok:
             code = 3 if "离线" in err else 5
