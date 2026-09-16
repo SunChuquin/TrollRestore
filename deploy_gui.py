@@ -44,7 +44,7 @@ LISTEN_PORT = 5052     # 本工具通知监听端口
 DEVICE_PORT = 5051     # KlineHTTP 端口
 IPA_PORT = 5053        # 本工具 IPA 下载服务端口（TrollStore 从此下载，不依赖 Kline 前台）
 IPA_SUB = ["Kline-unsigned-ipa", "Kline.ipa"]
-DEVICE_READY_SECONDS = 30   # 设备就绪门禁：下载 IPA 前等待 Kline 前台（有人值守）的最长秒数
+DEVICE_READY_SECONDS = 10   # 设备就绪门禁：下载 IPA 前等待 Kline 前台（有人值守）的最长秒数
 WAIT_KLINE_SECONDS = 180    # 上传前二次确认 Kline 前台的兜底等待秒数
 WAIT_REOPEN_SECONDS = 300   # 触发安装后，等待新版 Kline 重新打开的最长时间
 # 无人值守终态文案中的契约键：build_and_deploy.py 据此映射退出码 6（勿改名，跨进程字符串契约）
