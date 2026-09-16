@@ -326,7 +326,7 @@ def main():
     common = {"run_id": None, "commit": None, "message": args.message}
     try:
         # ---- 1. 提交 ----
-        log(f"[1/5] 提交变更到 {args.branch}（描述：{args.message}）")
+        log(f"[1/5] 提交变更到 {args.branch}")
         add_args = ["git", "add", *(args.files if args.files else ["-A"])]
         sh(add_args, cwd=repo)
         staged = sh(["git", "diff", "--cached", "--name-only"], cwd=repo).stdout.strip()
