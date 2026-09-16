@@ -32,6 +32,9 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
       KlineHTTP：iPad 锁屏 / Kline 未在前台 / USB 断连；助手未下载未安装）。等人工解锁
       iPad、打开 Kline 保持前台后，凭 RESULT 中的 run_id 重新 POST :5052/notify 续跑，
       无需重新构建
+  7 = GitHub API 轮询连续失败（瞬时 TLS/网络超时：每次失败间隔 5s 自动重试，连试 3 次仍失败）。
+      构建尚未结束/结论未知，非代码错误；先用 gh run view <run_id> / gh run watch <run_id>
+      确认 run 结论——成功则按部署流程继续（重新运行本脚本或直接 POST :5052/notify）
 
 依赖：Python 3.8+（仅标准库）、git、gh（已登录，repo 权限）。
 
@@ -60,6 +63,12 @@ ASSISTANT_START_TIMEOUT = 30  # 自动启动助手后等待其在线的最长时
 POLL_INTERVAL = 10        # 构建状态轮询间隔（秒）
 RUN_APPEAR_TIMEOUT = 120  # 推送后等待 Actions run 出现的最长时间（秒）
 DEPLOY_POLL_INTERVAL = 5  # 部署状态轮询间隔（秒）
+
+# GitHub API 轮询可靠性：瞬时网络故障（TLS handshake timeout 等）自动重试，
+# 连试 GH_POLL_RETRY 次仍失败则返回特殊退出码 GH_RETRY_EXIT（7），避免误判为 git 阶段失败（2）
+GH_POLL_RETRY = 3           # 轮询失败最大重试次数
+GH_POLL_RETRY_DELAY = 5     # 轮询失败后重试间隔（秒）
+GH_RETRY_EXIT = 7           # GitHub API 轮询连续失败的特殊退出码
 
 # deploy_gui.py 的终态 status 文案（部署等待循环据此判定）
 DEPLOY_OK_KEY = "✅ 部署完成"
@@ -104,10 +113,26 @@ def http_json(url, payload=None, timeout=5):
         return r.status, json.loads(r.read().decode("utf-8", "replace"))
 
 
+class GhPollError(RuntimeError):
+    """轮询 GitHub API 连续失败（瞬时网络超时等，已按 GH_POLL_RETRY 次重试耗尽），非代码错误"""
+
+
 def list_runs(cwd, limit=15):
-    out = gh(["run", "list", "--limit", str(limit),
-              "--json", "databaseId,headSha,status,conclusion,displayTitle,event"], cwd)
-    return json.loads(out.stdout)
+    """gh run list 并解析 JSON；瞬时网络故障按 GH_POLL_RETRY_DELAY 间隔自动重试，
+    连试 GH_POLL_RETRY 次仍失败抛 GhPollError（main 映射为退出码 7）"""
+    last = None
+    for attempt in range(1, GH_POLL_RETRY + 1):
+        try:
+            out = gh(["run", "list", "--limit", str(limit),
+                      "--json", "databaseId,headSha,status,conclusion,displayTitle,event"], cwd)
+            return json.loads(out.stdout)
+        except Exception as e:
+            last = e
+            if attempt < GH_POLL_RETRY:
+                log(f"⚠ 轮询 GitHub API 失败（第 {attempt}/{GH_POLL_RETRY} 次）：{e}，"
+                    f"{GH_POLL_RETRY_DELAY}s 后重试...")
+                time.sleep(GH_POLL_RETRY_DELAY)
+    raise GhPollError(f"连试 {GH_POLL_RETRY} 次轮询 GitHub API 均失败，最后错误：{last}")
 
 
 def wait_for_run(sha, branch, cwd, timeout):
@@ -374,6 +399,11 @@ def main():
         result_block(exit_code=4, stage="deploy-wait", assistant_status=final, **common)
         return 4
 
+    except GhPollError as e:
+        log(f"❌ {e}")
+        result_block(exit_code=GH_RETRY_EXIT, stage="gh-poll-retry-exhausted", error=str(e),
+                     hint="瞬时网络故障所致，非代码错误：gh run view <run_id> 确认构建结论后按部署流程继续", **common)
+        return GH_RETRY_EXIT
     except TimeoutError as e:
         log(f"❌ {e}")
         result_block(exit_code=4, stage="timeout", error=str(e), **common)
