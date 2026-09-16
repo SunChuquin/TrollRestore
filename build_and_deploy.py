@@ -142,7 +142,7 @@ def wait_for_run(sha, branch, cwd, timeout):
         for r in list_runs(cwd):
             if r.get("headSha") == sha:
                 rid = str(r["databaseId"])
-                log(f"✅ 已捕获本次构建 run={rid}")
+                # log(f"✅ 已捕获本次构建 run={rid}")
                 return rid
         remaining = int(deadline - time.time())
         # log(f"⏳ 等待 Actions run 出现（按 commit {sha[:7]} 匹配，剩余 {remaining}s）...")
@@ -161,9 +161,10 @@ def watch_run(rid, cwd, timeout):
         r = runs[0]
         state = f"{r.get('status')}:{r.get('conclusion') or ''}"
         if state != last_state:   # 仅状态变化时输出，避免刷屏
-            log(f"⏳ run={rid} 状态：{r.get('status')} {r.get('conclusion') or ''}")
+            # log(f"⏳ run={rid} 状态：{r.get('status')} {r.get('conclusion') or ''}")
             last_state = state
         if r.get("status") == "completed":
+            log(f"[5/5] 构建成功 run={rid} 状态")
             return r.get("conclusion") or "unknown"
         time.sleep(POLL_INTERVAL)
     raise TimeoutError(f"构建 {timeout}s 超时未结束，可稍后手动查看 run={rid}")
@@ -253,7 +254,7 @@ def notify_assistant(rid):
         return False, f"助手正忙（status={st}），本次通知会被忽略，请稍后重试", st
     baseline = st  # 通知前快照（可能是"空闲"或上一次的"✅ 部署完成：旧build"）
     http_json(f"{ASSISTANT_BASE}/notify", payload={"run_id": str(rid)}, timeout=5)
-    log(f"✅ 已通知自动部署助手部署 run={rid}（下载 IPA → USB 沙盒推送 → TrollStore 安装 → 自动打开校验）")
+    # log(f"✅ 已通知自动部署助手部署 run={rid}（下载 IPA → USB 沙盒推送 → TrollStore 安装 → 自动打开校验）")
     return True, "", baseline
 
 
@@ -331,7 +332,7 @@ def main():
         staged = sh(["git", "diff", "--cached", "--name-only"], cwd=repo).stdout.strip()
         if staged:
             sh(["git", "commit", "-m", args.message], cwd=repo)
-            log(f"   已提交 {len(staged.splitlines())} 个文件")
+            # log(f"   已提交 {len(staged.splitlines())} 个文件")
         else:
             log("   无暂存变更，跳过 commit")
 
@@ -358,7 +359,7 @@ def main():
         # log("[3/5] 捕获本次 Actions run ...")
         rid = wait_for_run(sha, args.branch, repo, RUN_APPEAR_TIMEOUT)
         common["run_id"] = rid
-        log(f"[4/5] 监控构建 run={rid}（典型耗时 40~85s，排队另计）...")
+        # log(f"[4/5] 监控构建 run={rid}（典型耗时 40~85s，排队另计）...")
         conclusion = watch_run(rid, repo, args.build_timeout)
 
         # ---- 4. 失败 → 输出日志供 AI 修复；成功 → 通知助手 ----
@@ -367,10 +368,10 @@ def main():
             result_block(exit_code=1, stage="build", conclusion=conclusion,
                          failed_log=failed_log, **common)
             return 1
-        log(f"✅ 构建成功 run={rid}")
+        # log(f"[5/5] 构建成功")
 
         # ---- 5. 通知助手（设备就绪门禁由助手在下载 IPA 前执行，30s）----
-        log("[5/5] 通知自动部署助手（其下载 IPA 前会先做 30s 设备就绪门禁）...")
+        # log("[5/5] 通知自动部署助手（其下载 IPA 前会先做 30s 设备就绪门禁）...")
         ok, err, baseline = notify_assistant(rid)
         if not ok:
             code = 3 if "离线" in err else 5
