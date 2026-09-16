@@ -142,11 +142,10 @@ def wait_for_run(sha, branch, cwd, timeout):
         for r in list_runs(cwd):
             if r.get("headSha") == sha:
                 rid = str(r["databaseId"])
-                log(f"✅ 已捕获本次构建 run={rid}（{r.get('displayTitle', '')[:50]}，"
-                    f"状态 {r.get('status')}）")
+                log(f"✅ 已捕获本次构建 run={rid}")
                 return rid
         remaining = int(deadline - time.time())
-        log(f"⏳ 等待 Actions run 出现（按 commit {sha[:7]} 匹配，剩余 {remaining}s）...")
+        # log(f"⏳ 等待 Actions run 出现（按 commit {sha[:7]} 匹配，剩余 {remaining}s）...")
         time.sleep(POLL_INTERVAL)
     raise TimeoutError(f"{timeout}s 内未发现 commit {sha[:7]} 对应的 Actions run")
 
@@ -271,7 +270,7 @@ def wait_deploy_done(timeout, baseline=None):
     while time.time() < deadline:
         st = assistant_status()
         if st and st != last:
-            log(f"⏳ 助手：{st}")
+            # log(f"⏳ 助手：{st}")
             last = st
         if st is None or st == baseline:
             time.sleep(DEPLOY_POLL_INTERVAL)
@@ -353,10 +352,10 @@ def main():
             sh(["git", "push", "origin", args.branch], cwd=repo)
         sha = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         common["commit"] = sha[:7]
-        log(f"✅ 已推送 {sha[:7]}")
+        # log(f"✅ 已推送 {sha[:7]}")
 
         # ---- 3. 捕获本次 run 并监控 ----
-        log("[3/5] 捕获本次 Actions run ...")
+        # log("[3/5] 捕获本次 Actions run ...")
         rid = wait_for_run(sha, args.branch, repo, RUN_APPEAR_TIMEOUT)
         common["run_id"] = rid
         log(f"[4/5] 监控构建 run={rid}（典型耗时 40~85s，排队另计）...")
@@ -390,10 +389,7 @@ def main():
         # 助手下载前 30s 设备门禁未通过 = 人不在设备前（锁屏/未前台），区别于普通部署超时
         if DEVICE_IDLE_KEY in final:
             log(f"🔒 {final}")
-            log("   构建已成功，助手未下载未安装。请解锁 iPad 并打开 Kline 保持前台，"
-                f"然后凭 run_id={rid} 重新 POST :5052/notify 续跑（无需重新构建）。")
-            result_block(exit_code=6, stage="device-gate", assistant_status=final,
-                         hint="人工解锁 iPad 并打开 Kline 后重新 POST :5052/notify 续跑", **common)
+            log("   构建已成功，助手未连接。")
             return 6
         log(f"❌ {final}")
         result_block(exit_code=4, stage="deploy-wait", assistant_status=final, **common)
@@ -401,9 +397,7 @@ def main():
 
     except GhPollError as e:
         log(f"❌ {e}")
-        result_block(exit_code=GH_RETRY_EXIT, stage="gh-poll-retry-exhausted", error=str(e),
-                     hint="瞬时网络故障所致，非代码错误：gh run view <run_id> 确认构建结论后按部署流程继续", **common)
-        return GH_RETRY_EXIT
+        return 7
     except TimeoutError as e:
         log(f"❌ {e}")
         result_block(exit_code=4, stage="timeout", error=str(e), **common)
