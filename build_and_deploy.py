@@ -164,7 +164,6 @@ def watch_run(rid, cwd, timeout):
             # log(f"⏳ run={rid} 状态：{r.get('status')} {r.get('conclusion') or ''}")
             last_state = state
         if r.get("status") == "completed":
-            log(f"[5/5] 构建成功 run={rid} 状态")
             return r.get("conclusion") or "unknown"
         time.sleep(POLL_INTERVAL)
     raise TimeoutError(f"构建 {timeout}s 超时未结束，可稍后手动查看 run={rid}")
@@ -326,18 +325,17 @@ def main():
     common = {"run_id": None, "commit": None, "message": args.message}
     try:
         # ---- 1. 提交 ----
-        log(f"[1/5] 提交变更到 {args.branch}")
         add_args = ["git", "add", *(args.files if args.files else ["-A"])]
         sh(add_args, cwd=repo)
         staged = sh(["git", "diff", "--cached", "--name-only"], cwd=repo).stdout.strip()
         if staged:
             sh(["git", "commit", "-m", args.message], cwd=repo)
-            # log(f"   已提交 {len(staged.splitlines())} 个文件")
+            log(f"   已提交 {len(staged.splitlines())} 个文件")
         else:
             log("   无暂存变更，跳过 commit")
 
         # ---- 2. 推送（含 non-fast-forward 自动 rebase 重试一次）----
-        log("[2/5] 推送到 GitHub 触发 Actions ...")
+        log("推送到 GitHub 触发 Actions ...")
         sh(["git", "fetch", "origin", args.branch], cwd=repo)
         head = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         remote = sh(["git", "rev-parse", f"origin/{args.branch}"], cwd=repo, check=False).stdout.strip()
