@@ -79,7 +79,7 @@ ASSISTANT_IDLE_OK = ("空闲", DEPLOY_OK_KEY) + DEPLOY_FAIL_KEYS
 
 
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+    print(f"{msg}", flush=True)
 
 
 def sh(args, cwd=None, check=True, timeout=None):
@@ -142,7 +142,7 @@ def wait_for_run(sha, branch, cwd, timeout):
         for r in list_runs(cwd):
             if r.get("headSha") == sha:
                 rid = str(r["databaseId"])
-                # log(f"✅ 已捕获本次构建 run={rid}")
+                log(f"✅ 已捕获本次构建 run={rid}")
                 return rid
         remaining = int(deadline - time.time())
         # log(f"⏳ 等待 Actions run 出现（按 commit {sha[:7]} 匹配，剩余 {remaining}s）...")
@@ -335,7 +335,7 @@ def main():
             log("   无暂存变更，跳过 commit")
 
         # ---- 2. 推送（含 non-fast-forward 自动 rebase 重试一次）----
-        log("推送到 GitHub 触发 Actions ...")
+        # log("推送到 GitHub 触发 Actions ...")
         sh(["git", "fetch", "origin", args.branch], cwd=repo)
         head = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         remote = sh(["git", "rev-parse", f"origin/{args.branch}"], cwd=repo, check=False).stdout.strip()
