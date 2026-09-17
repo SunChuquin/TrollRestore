@@ -234,7 +234,7 @@ def start_assistant():
     deadline = time.time() + ASSISTANT_START_TIMEOUT
     while time.time() < deadline:
         if assistant_status() is not None:
-            log(f"✅ 自动部署助手已启动并在线（解释器：{pythonw}）")
+            # log(f"✅ 自动部署助手已启动并在线（解释器：{pythonw}）")
             return True, ""
         time.sleep(1)
     return False, f"deploy_gui.py 已尝试启动但 {ASSISTANT_START_TIMEOUT}s 内未在线（:5052 无响应），请检查助手窗口"

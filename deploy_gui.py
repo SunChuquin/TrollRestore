@@ -272,13 +272,9 @@ class DeployWorker(QThread):
             fwd = start_forward()
             if not wait_online(DEVICE_READY_SECONDS, self.log.emit):
                 self.log.emit(
-                    f"🔒 {DEVICE_READY_SECONDS}s 内 Kline 未在前台"
-                    "（iPad 锁屏 / Kline 未打开 / USB 断连），本次不下载、不安装。")
-                self.log.emit(
-                    f"   请解锁 iPad 并打开 Kline 保持前台，然后重新通知部署"
-                    f"（POST /notify run_id={self.run_id}），构建产物已在，无需重新构建。")
+                    f" {DEVICE_READY_SECONDS}s 内 iPad 锁屏或 Kline 未在前台")
                 self.status.emit(
-                    f"🔒 {DEVICE_IDLE_KEY}：iPad 锁屏或 Kline 未在前台"
+                    f" iPad 锁屏或 Kline 未在前台"
                     f"（run={self.run_id} 构建已完成，解锁打开 Kline 后重新通知部署）")
                 return
             self.log.emit("✅ 设备就绪（Kline 前台在线），继续下载与部署")
