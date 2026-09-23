@@ -30,7 +30,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from PySide2.QtCore import QObject, QThread, Signal, Qt
+from PySide2.QtCore import QObject, QThread, Signal, Qt, QTimer
 from PySide2.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
@@ -52,6 +52,9 @@ DEVICE_IDLE_KEY = "设备无人值守"
 GH_POLL_SECONDS = 30        # 自动监控：轮询 GitHub Actions 最新 run 的间隔
 RUN_LIST_LOOKUP = 500       # 手动输入 #编号 时，最多回溯多少个 run 查找对应的 databaseId
 STATE_FILE = Path(__file__).resolve().parent / "deploy_state.json"   # 记住上次已处理的 run id，避免重复部署
+# 部署结束（任何终态）后自动回到"空闲"的延迟（ms）。须明显大于 build_and_deploy.py 的
+# 部署状态轮询间隔（5s）以保留终态可见窗口，随后恢复空闲，避免下次通知被误判为"忙"（原退出码 5）
+IDLE_RESET_MS = 15000
 
 # Windows 上本助手由 pythonw.exe（GUI 进程）运行，自身无控制台；子进程若不加 CREATE_NO_WINDOW
 # 会各自弹一个临时 cmd 窗口（gh/netstat/taskkill/pymobiledevice3 都是控制台程序）。
@@ -274,7 +277,7 @@ class DeployWorker(QThread):
                 self.log.emit(
                     f" {DEVICE_READY_SECONDS}s 内 iPad 锁屏或 Kline 未在前台")
                 self.status.emit(
-                    f" iPad 锁屏或 Kline 未在前台"
+                    f"{DEVICE_IDLE_KEY}：iPad 锁屏或 Kline 未在前台"
                     f"（run={self.run_id} 构建已完成，解锁打开 Kline 后重新通知部署）")
                 return
             self.log.emit("✅ 设备就绪（Kline 前台在线），继续下载与部署")
@@ -602,7 +605,22 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.log)
         self.worker.status.connect(lambda s: (set_status(s), self.status_label.setText(s)))
         self.worker.poll_ctrl.connect(self.on_poll_ctrl)
+        self.worker.finished.connect(lambda: self._schedule_idle_reset(self.worker))
         self.worker.start()
+
+    def _schedule_idle_reset(self, worker):
+        """部署结束（成功/超时/失败/设备无人值守）后短暂保留终态供脚本轮询与人工查看，
+        随后自动回到"空闲"，保证下次 build_and_deploy.py 通知时不被当成"忙"。
+        若延迟窗口内已有新的部署启动（self.worker 已被替换），则交给新流程管理状态。"""
+
+        def reset():
+            if getattr(self, "worker", None) is not worker:
+                return
+            if get_status() != "空闲":
+                set_status("空闲")
+                self.status_label.setText("空闲")
+
+        QTimer.singleShot(IDLE_RESET_MS, reset)
 
 
 def main():

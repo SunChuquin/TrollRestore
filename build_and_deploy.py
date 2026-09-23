@@ -7,7 +7,8 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
   1. 接收 AI 传入的提交描述信息，git add + commit + push 触发 GitHub Actions
   2. 轮询监控本次推送（按 headSha 匹配）的 Actions run 直到结束
   3. 构建失败 → 拉取失败日志，保存到 build_logs 并摘录 error 行输出，供 AI 分析修复（退出码 1）
-  4. 构建成功 → 检测自动部署助手（deploy_gui.py）：离线则自动后台拉起并等在线，
+  4. 构建成功 → 检测自动部署助手（deploy_gui.py）：离线则自动后台拉起并等在线；
+     若助手正忙于部署其它 run，先等待其结束（回到任意终态/空闲）再通知；
      然后 POST :5052/notify {"run_id"} 通知部署
   5. 助手自动执行：设备就绪门禁（下载 IPA 前 30s 探测 KlineHTTP，仅 Kline 前台时响应）
      → 下载 IPA → USB 沙盒推送 → TrollStore 安装 → opener 自动打开新版并校验版本。
@@ -26,8 +27,7 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
   1 = 构建失败（编译日志已保存并摘录输出）
   2 = git 提交/推送失败（无可推送变更也归此类）
   3 = 自动部署助手无法自动启动（或启动后未在线，请检查 deploy_gui.py 窗口）
-  4 = 等待超时（run 未出现 / 构建超时 / 部署未达终态）
-  5 = 助手正忙（部署中，通知会被忽略，稍后重试）
+  4 = 等待超时（run 未出现 / 构建超时 / 部署未达终态 / 通知时等待助手空闲超时）
   6 = 设备无人值守（构建已成功且已通知助手，但助手在下载 IPA 前的 30s 门禁窗口内探测不到
       KlineHTTP：iPad 锁屏 / Kline 未在前台 / USB 断连；助手未下载未安装）。等人工解锁
       iPad、打开 Kline 保持前台后，凭 RESULT 中的 run_id 重新 POST :5052/notify 续跑，
@@ -41,6 +41,8 @@ build_and_deploy.py — Kline 端到端自动构建部署工作流（Windows，�
 已知契约（deploy_gui.py 5052）：POST /notify 先回响应、后经 Qt 信号启动部署，
 故通知后助手 status 会短暂停留在**上一次的终态**（如"✅ 部署完成：旧build"）。
 等待终态时必须先观察到 status 离开通知前快照（新部署真正开始），否则会把旧成功误判成本次完成。
+助手在每个部署终态（含"设备无人值守"）后约 15s 自动回到"空闲"（终态窗口内本脚本 5s 轮询
+仍可捕获），因此再次通知时不会再因残留终态被误判为"忙"（原退出码 5 失败路径已整体移除）。
 """
 
 import argparse
@@ -76,6 +78,9 @@ DEPLOY_OK_KEY = "✅ 部署完成"
 DEVICE_IDLE_KEY = "设备无人值守"
 DEPLOY_FAIL_KEYS = ("部署失败", "部署超时", DEVICE_IDLE_KEY)
 ASSISTANT_IDLE_OK = ("空闲", DEPLOY_OK_KEY) + DEPLOY_FAIL_KEYS
+# 通知时助手正忙（正在部署其它 run）时，先等待其结束再通知的最长秒数；
+# 最坏情况覆盖一次完整部署（门禁 + 下载 + 上传 + 等待 iPad 确认安装 ≤ ~7min）
+ASSISTANT_BUSY_WAIT = 420
 
 
 def log(msg: str) -> None:
@@ -240,18 +245,30 @@ def start_assistant():
     return False, f"deploy_gui.py 已尝试启动但 {ASSISTANT_START_TIMEOUT}s 内未在线（:5052 无响应），请检查助手窗口"
 
 
-def notify_assistant(rid):
-    """确保助手在线（离线则自动启动），检查空闲后 POST /notify 触发部署。
-    返回 (ok, err, baseline)：baseline 为 POST 前的 status 快照（通常是上一次的终态），
-    供 wait_deploy_done 区分"旧终态残留"与"本次部署的新终态"。"""
+def notify_assistant(rid, busy_timeout=ASSISTANT_BUSY_WAIT):
+    """确保助手在线（离线则自动启动）；若正忙（正在部署其它 run），等待其回到任意
+    终态/空闲再通知，避免误报"忙"（原退出码 5 的失败路径已移除）。
+    返回 (ok, err, baseline)：baseline 为 POST 前的 status 快照（通常是"空闲"
+    或上一次部署的终态），供 wait_deploy_done 区分"旧终态残留"与"本次部署的新终态"。"""
     if assistant_status() is None:
         ok, err = start_assistant()
         if not ok:
             return False, err, None
-    st = assistant_status()
-    if st and not any(k in st for k in ASSISTANT_IDLE_OK):
-        return False, f"助手正忙（status={st}），本次通知会被忽略，请稍后重试", st
-    baseline = st  # 通知前快照（可能是"空闲"或上一次的"✅ 部署完成：旧build"）
+    deadline = time.time() + busy_timeout
+    last_busy = None
+    while True:
+        st = assistant_status()
+        if st and any(k in st for k in ASSISTANT_IDLE_OK):
+            break   # 空闲或处于某个可接收新通知的终态
+        if time.time() >= deadline:
+            return False, (f"助手 {busy_timeout}s 内未回到空闲"
+                           f"（最后状态：{last_busy or '无响应'}），"
+                           "可能部署卡死，请检查助手窗口"), None
+        if st != last_busy:
+            log(f"⏳ 助手正忙（{st}），等待其完成本次部署后继续...")
+            last_busy = st
+        time.sleep(DEPLOY_POLL_INTERVAL)
+    baseline = st  # 通知前快照（可能是"空闲"或上一次的"✅ 部署完成：旧build"等终态）
     http_json(f"{ASSISTANT_BASE}/notify", payload={"run_id": str(rid)}, timeout=5)
     # log(f"✅ 已通知自动部署助手部署 run={rid}（下载 IPA → USB 沙盒推送 → TrollStore 安装 → 自动打开校验）")
     return True, "", baseline
@@ -372,7 +389,7 @@ def main():
         # log("[5/5] 通知自动部署助手（其下载 IPA 前会先做 30s 设备就绪门禁）...")
         ok, err, baseline = notify_assistant(rid)
         if not ok:
-            code = 3 if "离线" in err else 5
+            code = 3 if "离线" in err else 4
             log(f"❌ {err}")
             result_block(exit_code=code, stage="deploy-notify", error=err, **common)
             return code
