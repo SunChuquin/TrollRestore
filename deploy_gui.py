@@ -232,12 +232,18 @@ def fetch_kline_status() -> dict:
 def upload_stream(local: Path, remote: str, log) -> None:
     import requests
     size = local.stat().st_size
-    url = f"http://127.0.0.1:{DEVICE_PORT}/sandbox/{remote}"
+    # 走 /upload?name=<file> → 公共 Downloads（/var/mobile/Media/Downloads），写端点不设门禁；
+    # 不要走 PUT /sandbox：490 起沙盒读写有 LAN 门禁，TrollStore 回读 GET /sandbox/... 带不了
+    # X-Kline-Client 头会被 403，拿到 JSON 错误体当 IPA → 「failed to extract ipa」
+    name = Path(remote).name
+    url = f"http://127.0.0.1:{DEVICE_PORT}/upload?name={name}"
     with open(local, "rb") as f:
-        r = requests.put(url, data=f, headers={"Content-Length": str(size)}, timeout=1800)
+        r = requests.put(url, data=f,
+                         headers={"Content-Length": str(size), "X-Kline-Client": "pipeline"},
+                         timeout=1800)
     if r.status_code != 200:
         raise RuntimeError(f"沙盒上传失败 HTTP {r.status_code}: {r.text[:200]}")
-    log(f"✅ 上传完成 {size:,} bytes")
+    log(f"✅ 上传完成 {size:,} bytes -> 公共 Downloads/{name}")
 
 
 # ============ 流水线工作线程 ============
@@ -315,8 +321,8 @@ class DeployWorker(QThread):
             #    注意：Kline 调 URL scheme 后会切后台，本地 HTTP 有短暂冻结窗口；
             #    2MB 下载极快，通常成功。若偶发失败，重新打开 Kline 后重试即可。
             self.status.emit("触发 TrollStore 安装...")
-            self.log.emit("▶ POST /install-local (scope=sandbox, 本地下载)...")
-            body = json.dumps({"file": "Downloads/Kline.ipa", "scope": "sandbox"}).encode("utf-8")
+            self.log.emit("▶ POST /install-local (scope=download, 公共 Downloads 本地下载，无门禁)...")
+            body = json.dumps({"file": Path("Downloads/Kline.ipa").name, "scope": "download"}).encode("utf-8")
             req = urllib.request.Request(
                 f"http://127.0.0.1:{DEVICE_PORT}/install-local",
                 data=body, headers={"Content-Type": "application/json"}, method="POST",
