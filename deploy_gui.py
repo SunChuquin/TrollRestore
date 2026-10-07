@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Kline-TS 自动部署助手（PySide2 GUI）
-
+r"""Kline-TS 自动部署助手（PySide2 GUI）
 工作方式：
   1. TRAE 推送代码并监控 GitHub Actions
   2. 构建成功生成 IPA 后，TRAE 只需 POST 通知本工具：
@@ -15,9 +14,11 @@
   5. 安装完成后用户打开新版 Kline：助手自动检测新版上线（KlineHTTP 回报版本号）
      并从"等待 iPad 确认安装"自动转为"部署完成"
 
-运行：.venv-ios\\Scripts\\python.exe deploy_gui.py
+运行：Windows: .venv-ios\Scripts\python.exe deploy_gui.py
+      macOS:   .venv-mac/bin/python deploy_gui.py
 """
 import json
+import os
 import plistlib
 import shutil
 import socket
@@ -30,16 +31,33 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from PySide2.QtCore import QObject, QThread, Signal, Qt, QTimer
-from PySide2.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
-)
+try:
+    from PySide2.QtCore import QObject, QThread, Signal, Qt, QTimer
+    from PySide2.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
+    )
+except ImportError:   # macOS/Python>=3.10 无 PySide2 轮子，回退 PySide6（API 兼容本工具用到的子集）
+    from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
+    )
 
 # ============ 配置 ============
-PM = Path(r"c:\Users\sunck\home\projects\ios\.venv-ios\Scripts\pymobiledevice3.exe")
-REPO_DIR = Path(r"c:\Users\sunck\home\projects\ios\Kline")
-ARTIFACTS_DIR = Path(r"c:\Users\sunck\home\projects\ios\artifacts")
+IS_MAC = sys.platform == "darwin"
+_HERE = Path(__file__).resolve().parent
+if IS_MAC:
+    # 经 `open`/LaunchServices 启动时 PATH 是精简集，gh/lsof 等子进程会找不到，先补全
+    os.environ["PATH"] = ("/opt/homebrew/bin:/usr/local/bin:"
+                          "/usr/bin:/bin:/usr/sbin:/sbin:") + os.environ.get("PATH", "")
+    PM = _HERE / ".venv-mac" / "bin" / "pymobiledevice3"
+    REPO_DIR = Path("/Volumes/home/repositories/Kline2")
+    ARTIFACTS_DIR = _HERE / "artifacts"
+else:
+    PM = Path(r"c:\Users\sunck\home\projects\ios\.venv-ios\Scripts\pymobiledevice3.exe")
+    REPO_DIR = Path(r"c:\Users\sunck\home\projects\ios\Kline")
+    ARTIFACTS_DIR = Path(r"c:\Users\sunck\home\projects\ios\artifacts")
 LISTEN_PORT = 5052     # 本工具通知监听端口
 DEVICE_PORT = 5051     # KlineHTTP 端口
 IPA_PORT = 5053        # 本工具 IPA 下载服务端口（TrollStore 从此下载，不依赖 Kline 前台）
@@ -165,26 +183,46 @@ def resolve_run_id(text: str) -> tuple[str, dict]:
 
 def kill_port(port: int) -> None:
     try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace",
-                             creationflags=NO_WINDOW_FLAGS).stdout
-        for line in out.splitlines():
-            if f":{port}" in line and "LISTENING" in line:
-                pid = line.split()[-1]
-                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True,
-                               creationflags=NO_WINDOW_FLAGS)
+        if IS_MAC:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                                 capture_output=True, text=True).stdout
+            for pid in out.split():
+                subprocess.run(["kill", "-9", pid], capture_output=True)
+        else:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=NO_WINDOW_FLAGS).stdout
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    pid = line.split()[-1]
+                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True,
+                                   creationflags=NO_WINDOW_FLAGS)
     except Exception:
         pass
+
+
+def pick_usb_serial() -> str | None:
+    """多设备时优先取 USB 直连设备的 UDID（mac 上 iPhone 走网络列表可能排在前面，
+    forward 不指定 serial 会默认命中列表第一个设备，把流量打到错误设备上）"""
+    try:
+        out = subprocess.run([str(PM), "usbmux", "list"], capture_output=True,
+                             text=True, timeout=15).stdout
+        devices = json.loads(out)
+        usb = [d for d in devices if d.get("ConnectionType") == "USB"]
+        return (usb or devices or [{}])[0].get("Identifier")
+    except Exception:
+        return None
 
 
 def start_forward() -> subprocess.Popen:
     kill_port(DEVICE_PORT)
     time.sleep(1)
-    fwd = subprocess.Popen(
-        [str(PM), "usbmux", "forward", str(DEVICE_PORT), str(DEVICE_PORT)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=NO_WINDOW_FLAGS,
-    )
+    cmd = [str(PM), "usbmux", "forward", str(DEVICE_PORT), str(DEVICE_PORT)]
+    serial = pick_usb_serial() if IS_MAC else None
+    if serial:
+        cmd += ["--serial", serial]
+    fwd = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=NO_WINDOW_FLAGS)
     time.sleep(3)
     return fwd
 
@@ -633,7 +671,7 @@ def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec() if hasattr(app, "exec") else app.exec_())
 
 
 if __name__ == "__main__":
