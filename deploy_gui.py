@@ -31,17 +31,24 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+_HERE_DIR = Path(__file__).resolve().parent
+if str(_HERE_DIR) not in sys.path:
+    sys.path.insert(0, str(_HERE_DIR))
+import lansync   # 联机同步（沙盒模拟目录 + 暴露服务 + 拉取/推送客户端，零 Kline 代码改动）
+
 try:
     from PySide2.QtCore import QObject, QThread, Signal, Qt, QTimer
     from PySide2.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
+        QDialog, QDialogButtonBox, QGridLayout,
     )
 except ImportError:   # macOS/Python>=3.10 无 PySide2 轮子，回退 PySide6（API 兼容本工具用到的子集）
     from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPlainTextEdit, QPushButton, QLabel, QLineEdit, QGroupBox, QCheckBox,
+        QDialog, QDialogButtonBox, QGridLayout,
     )
 
 # ============ 配置 ============
@@ -103,6 +110,23 @@ def load_last_processed() -> str:
 def save_last_processed(run_id: str) -> None:
     try:
         STATE_FILE.write_text(json.dumps({"last_run_id": run_id}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def state_get(key: str, default=None):
+    """读 deploy_state.json 里的扩展键（联机同步的记忆项等）"""
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8")).get(key, default)
+    except Exception:
+        return default
+
+
+def state_set(key: str, value) -> None:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+        data[key] = value
+        STATE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -461,6 +485,70 @@ class PollWorker(QThread):
                 time.sleep(0.5)
 
 
+# ============ 联机同步：通用后台执行 + 类别选择弹窗 ============
+class FuncWorker(QThread):
+    """跑一个同步函数（lansync 拉取/推送/重置），log/err 信号回主线程"""
+    log = Signal(str)
+    ok = Signal(str)        # 成功消息
+    err = Signal(str)       # 失败消息
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            msg = self.fn(lambda s: self.log.emit(str(s)))
+            self.ok.emit(str(msg or "完成"))
+        except Exception as e:
+            self.err.emit(str(e))
+
+
+class SyncSelectDialog(QDialog):
+    """联机同步类别选择：6 类勾选（记忆上次选择）+ 设备 IP:端口（记忆上次输入）"""
+
+    def __init__(self, mode: str, parent=None):
+        super().__init__(parent)
+        self.mode = mode   # "pull" / "push"
+        self.setWindowTitle("从 Kline 拉取" if mode == "pull" else "推送到 Kline")
+        self.resize(380, 260)
+        lay = QVBoxLayout(self)
+
+        tip = ("勾选要从设备拉进沙盒目录的类别。" if mode == "pull"
+               else "把沙盒目录中勾选的类别推送到设备（设备侧先备份原文件）。")
+        tip += "\n前提：设备 Kline 在前台并打开「暴露」，此处填其 局域网IP:端口。"
+        lbl = QLabel(tip)
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self.peer_edit = QLineEdit()
+        self.peer_edit.setPlaceholderText("设备 IP:端口（如 192.168.137.20:5051）")
+        self.peer_edit.setText(str(state_get("lansync_peer", "")))
+        lay.addWidget(self.peer_edit)
+
+        grid = QGridLayout()
+        saved = state_get("lansync_sel") or {}
+        self.checks = {}
+        for i, cat in enumerate(lansync.CATEGORIES):
+            extra = "（1.4GB 走 WiFi，实测耗时）" if cat == "main" else ""
+            chk = QCheckBox(f"{lansync.CATEGORY_TITLES[cat]}{extra}")
+            chk.setChecked(bool(saved.get(cat, cat in ("favorites", "sim", "layouts", "indicators"))))
+            self.checks[cat] = chk
+            grid.addWidget(chk, i // 2, i % 2)
+        lay.addLayout(grid)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def selected(self):
+        return [c for c in lansync.CATEGORIES if self.checks[c].isChecked()]
+
+    def peer(self):
+        return self.peer_edit.text().strip()
+
+
 # ============ IPA 下载服务（电脑侧，TrollStore 从此下载，不依赖 Kline 前台） ============
 class IPAHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -571,6 +659,35 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.btn_clear)
         lay.addWidget(gb)
 
+        # 联机同步区（沙盒模拟目录 + 暴露 + 拉取/推送）
+        gb_sync = QGroupBox("联机同步（模拟沙盒目录，替代设备间点对点同步）")
+        v = QVBoxLayout(gb_sync)
+        self.chk_expose = QCheckBox(
+            f"暴露给 Kline（mDNS 广播 + 授权拉取，服务端口 {lansync.SYNC_PORT}）")
+        self.chk_expose.toggled.connect(self.on_expose_toggled)
+        v.addWidget(self.chk_expose)
+        row1 = QHBoxLayout()
+        for text, slot in (("打开沙盒目录", self.open_sandbox_dir),
+                           ("重置为内置数据", lambda: self.run_sync_job(
+                               "重置为内置数据", lansync.reset_to_builtin)),
+                           ("存当前为内置", lambda: self.run_sync_job(
+                               "存当前为内置", lansync.save_as_builtin))):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            row1.addWidget(b)
+        row1.addStretch(1)
+        v.addLayout(row1)
+        row2 = QHBoxLayout()
+        self.btn_pull = QPushButton("从 Kline 拉取…")
+        self.btn_pull.clicked.connect(lambda: self.on_sync_dialog("pull"))
+        self.btn_push = QPushButton("推送到 Kline…")
+        self.btn_push.clicked.connect(lambda: self.on_sync_dialog("push"))
+        row2.addWidget(self.btn_pull)
+        row2.addWidget(self.btn_push)
+        row2.addStretch(1)
+        v.addLayout(row2)
+        lay.addWidget(gb_sync)
+
         # 日志区
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -602,6 +719,89 @@ class MainWindow(QMainWindow):
             self.poll_worker.start()
             self.log(f"✅ 自动监控已启动：每 {GH_POLL_SECONDS}s 轮询 GitHub 新构建"
                      f"（上次已处理 run={load_last_processed() or '无'}）")
+
+        # ---- 联机同步：播种沙盒目录 → 自动打开资源管理器 → 启动暴露服务 ----
+        try:
+            lansync.ensure_sandbox_seeded(self.log)
+            self.sync_server = lansync.ExposeServer(self.log)
+            self.sync_server.start()
+        except Exception as e:
+            self.log(f"⚠ 联机同步初始化失败: {e}")
+            self.sync_server = None
+        try:
+            self.open_sandbox_dir()
+        except Exception as e:
+            self.log(f"⚠ 打开沙盒目录失败: {e}")
+
+    # ---- 联机同步处理 ----
+
+    def open_sandbox_dir(self):
+        path = str(lansync.SANDBOX_DIR)
+        if IS_MAC:
+            subprocess.Popen(["open", path])
+        else:
+            os.startfile(path)   # noqa: 资源管理器打开（用户拖拽复制粘贴的入口）
+        self.log(f"📁 沙盒目录: {path}")
+
+    def on_expose_toggled(self, on: bool):
+        if getattr(self, "sync_server", None) is None:
+            self.log("⚠ 联机同步服务未启动，无法暴露")
+            return
+        self.sync_server.expose(bool(on))
+
+    def run_sync_job(self, title: str, fn):
+        """联机同步小任务（重置/存内置）后台执行，避免卡 GUI"""
+        self.log(f"▶ {title} ...")
+        self._sync_btn_busy(True)
+        self._sync_worker = FuncWorker(fn)
+        self._sync_worker.log.connect(self.log)
+        self._sync_worker.err.connect(lambda m: self.log(f"❌ {title}失败: {m}"))
+        self._sync_worker.finished.connect(lambda: self._sync_btn_busy(False))
+        self._sync_worker.start()
+
+    def _sync_btn_busy(self, busy: bool):
+        for b in (self.btn_pull, self.btn_push):
+            b.setEnabled(not busy)
+
+    @staticmethod
+    def _parse_peer(text: str):
+        t = text.strip()
+        if not t:
+            raise RuntimeError("请填写设备 IP:端口")
+        host, _, port = t.rpartition(":")
+        if not host:
+            host, port = t, "5051"
+        try:
+            return host, int(port)
+        except ValueError:
+            raise RuntimeError(f"端口非法: {text}")
+
+    def on_sync_dialog(self, mode: str):
+        dlg = SyncSelectDialog(mode, self)
+        accepted = dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+        if accepted != QDialog.Accepted:
+            return
+        try:
+            host, port = self._parse_peer(dlg.peer())
+            cats = dlg.selected()
+        except Exception as e:
+            self.log(f"❌ {e}")
+            return
+        if not cats:
+            self.log("⚠ 未勾选任何类别")
+            return
+        state_set("lansync_peer", dlg.peer().strip())
+        state_set("lansync_sel", {c: (c in cats) for c in lansync.CATEGORIES})
+        action = lansync.pull_from_kline if mode == "pull" else lansync.push_to_kline
+        verb = "从 Kline 拉取" if mode == "pull" else "推送到 Kline"
+        title = f"{verb}（{','.join(lansync.CATEGORY_TITLES[c] for c in cats)}）"
+        self.log(f"▶ {title} ←→ {host}:{port}")
+        self._sync_btn_busy(True)
+        self._sync_worker = FuncWorker(lambda log_fn: action(host, port, cats, log=log_fn))
+        self._sync_worker.log.connect(self.log)
+        self._sync_worker.err.connect(lambda m: self.log(f"❌ {title}失败: {m}"))
+        self._sync_worker.finished.connect(lambda: self._sync_btn_busy(False))
+        self._sync_worker.start()
 
     def log(self, text: str):
         self.log_view.appendPlainText(text)

@@ -195,3 +195,7 @@ cython_debug/
 /ts_out.txt
 /wi_err.txt
 /wi_out.txt
+
+# 联机同步：内置数据与设备 ID（大文件/机器相关，不进 git）
+sandbox_builtin/
+lansync_devid.txt
